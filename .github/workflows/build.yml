@@ -1,1 +1,120 @@
-# put code here
+name: Build Lumen (Windows)
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+  VULKAN_SDK_VERSION: "1.3.290.0"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install Vulkan SDK
+      uses: jakoch/install-vulkan-sdk-action@v1
+      with:
+        vulkan_version: ${{ env.VULKAN_SDK_VERSION }}
+
+    - name: Configure CMake
+      run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
+
+    - name: Build
+      run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+    # ---------- Упаковка бинарника и сцены ----------
+    - name: Create ZIP archive (binary + scene)
+      shell: pwsh
+      run: |
+        $exe = Get-ChildItem -Path build -Filter Lumen.exe -Recurse | Select-Object -First 1
+        if (-not $exe) { throw "Lumen.exe не найден" }
+        New-Item -ItemType Directory -Path dist -Force | Out-Null
+        Copy-Item $exe.FullName -Destination dist\
+        if (Test-Path "scenes/material_test") {
+          Copy-Item -Recurse "scenes/material_test" -Destination dist\
+        }
+        Compress-Archive -Path dist\* -DestinationPath Lumen-windows-x64.zip -Force
+
+    - name: Upload binary+scene artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Lumen-windows-x64
+        path: Lumen-windows-x64.zip
+
+    # ---------- АВТОМАТИЧЕСКИЙ РЕНДЕР: захват окна Lumen ----------
+    - name: Render material_test scene (auto-capture)
+      shell: pwsh
+      continue-on-error: true          # сборка не упадёт, если захват не удался
+      run: |
+        $exe = Get-ChildItem -Path build -Filter Lumen.exe -Recurse | Select-Object -First 1
+        if (-not $exe) { throw "Lumen.exe не найден" }
+
+        # Ищем JSON-файл сцены material_test
+        $sceneJson = Get-ChildItem -Path "scenes/material_test" -Filter *.json -Recurse | Select-Object -First 1
+        if (-not $sceneJson) {
+          Write-Warning "JSON-файл в scenes/material_test не найден. Пропускаем рендер."
+          exit 0
+        }
+        Write-Host "Используем сцену: $($sceneJson.FullName)"
+
+        # Запускаем Lumen
+        $proc = Start-Process -FilePath $exe.FullName -ArgumentList "`"$($sceneJson.FullName)`"" -PassThru
+        Write-Host "Lumen запущен (PID $($proc.Id)). Ожидание 30 секунд..."
+        Start-Sleep -Seconds 30
+
+        # Делаем снимок окна через .NET (без внешних утилит)
+        Add-Type -AssemblyName System.Drawing
+        Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public class Win32 {
+            [DllImport("user32.dll")]
+            public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+            [DllImport("user32.dll")]
+            public static extern bool SetForegroundWindow(IntPtr hWnd);
+            public struct RECT { public int Left, Top, Right, Bottom; }
+          }
+        "@
+
+        # Даём Lumen шанс выйти на передний план
+        [Win32]::SetForegroundWindow($proc.MainWindowHandle) | Out-Null
+        Start-Sleep -Seconds 2
+
+        $rect = New-Object Win32+RECT
+        if ([Win32]::GetWindowRect($proc.MainWindowHandle, [ref]$rect)) {
+          $width  = $rect.Right  - $rect.Left
+          $height = $rect.Bottom - $rect.Top
+          $bmp = New-Object System.Drawing.Bitmap $width, $height
+          $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+          $gfx.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bmp.Size)
+          $outPng = "render_material_test.png"
+          $bmp.Save($outPng, [System.Drawing.Imaging.ImageFormat]::Png)
+          $gfx.Dispose()
+          $bmp.Dispose()
+          Write-Host "PNG сохранён: $outPng ($width x $height)"
+        } else {
+          Write-Warning "Не удалось получить размеры окна Lumen."
+        }
+
+        # Завершаем процесс Lumen
+        if (-not $proc.HasExited) {
+          $proc.Kill()
+          Write-Host "Lumen завершён."
+        }
+
+    - name: Upload rendered PNG
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: Lumen-render-png
+        path: render_material_test.png
+        if-no-files-found: warn
